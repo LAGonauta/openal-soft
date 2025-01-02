@@ -53,6 +53,7 @@
 #include <cstring>
 #include <future>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -2166,30 +2167,52 @@ auto WasapiPlayback::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
 #endif
     setDefaultWFXChannelOrder();
 
+    auto period_time = ReferenceTime{};
+    auto min_period_time = ReferenceTime{};
+    hr = audio.mClient->GetDevicePeriod(&reinterpret_cast<REFERENCE_TIME&>(period_time), &reinterpret_cast<REFERENCE_TIME&>(min_period_time));
+    if (FAILED(hr))
+    {
+        ERR("Failed to get device period: {:#x}", as_unsigned(hr));
+        return hr;
+    }
+
+    const auto use_min_period = GetConfigValueBool(mDevice->mDeviceName, "wasapi", "use-min-period", false);
+    if (use_min_period)
+    {
+        period_time = min_period_time;
+    }
+
     if(sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE)
     {
         hr = audio.mClient->Initialize(sharemode, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            per_time.count(), per_time.count(), &OutputType.Format, nullptr);
+            period_time.count(), period_time.count(), &OutputType.Format, nullptr);
         if(hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
         {
-            auto newsize = UINT32{};
-            hr = audio.mClient->GetBufferSize(&newsize);
-            if(SUCCEEDED(hr))
+            WARN("Device requires aligned buffer, retrying...");
+            // Align period to 128 bytes as required by Intel HDA specification
+            const auto alignment_bytes = std::lcm(mFormat.Format.nBlockAlign, 128);
+            const auto alignment_frames = alignment_bytes / mFormat.Format.nBlockAlign;
+            const auto desired_period_frames = static_cast<int64_t>(std::round(static_cast<double_t>(period_time.count() * mFormat.Format.nSamplesPerSec) / 10000000));
+            const auto min_period_frames = static_cast<int64_t>(std::ceil(static_cast<double_t>(min_period_time.count() * mFormat.Format.nSamplesPerSec) / 10000000));
+            auto segments = desired_period_frames / alignment_frames;
+            if (segments * alignment_frames < min_period_frames)
             {
-                const auto newper = ReferenceTime{seconds{newsize}}
-                    / OutputType.Format.nSamplesPerSec;
-
-                audio.mClient = nullptr;
-                hr = helper.activateAudioClient(mmdev, __uuidof(IAudioClient),
-                    al::out_ptr(audio.mClient));
-                if(FAILED(hr))
-                {
-                    ERR("Failed to reactivate audio client: {:#x}", as_unsigned(hr));
-                    return hr;
-                }
-                hr = audio.mClient->Initialize(sharemode, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                    newper.count(), newper.count(), &OutputType.Format, nullptr);
+                segments += 1;
             }
+
+            // https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize#remarks
+            *&reinterpret_cast<REFERENCE_TIME&>(period_time) = ((10000.0 * 1000.0 / mFormat.Format.nSamplesPerSec * (alignment_frames * segments)) + 0.5);
+
+            audio.mClient = nullptr;
+            hr = helper.activateAudioClient(mmdev, __uuidof(IAudioClient),
+                al::out_ptr(audio.mClient));
+            if (FAILED(hr))
+            {
+                ERR("Failed to reactivate audio client: {:#x}", as_unsigned(hr));
+                return hr;
+            }
+            hr = audio.mClient->Initialize(sharemode, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                period_time.count(), period_time.count(), &OutputType.Format, nullptr);
         }
     }
     else
@@ -2202,10 +2225,7 @@ auto WasapiPlayback::resetProxy(DeviceHelper &helper, DeviceHandle &mmdev,
     }
 
     auto buffer_len = UINT32{};
-    auto period_time = ReferenceTime{};
-    hr = audio.mClient->GetDevicePeriod(&reinterpret_cast<REFERENCE_TIME&>(period_time), nullptr);
-    if(SUCCEEDED(hr))
-        hr = audio.mClient->GetBufferSize(&buffer_len);
+    hr = audio.mClient->GetBufferSize(&buffer_len);
     if(FAILED(hr))
     {
         ERR("Failed to get audio buffer info: {:#x}", as_unsigned(hr));
